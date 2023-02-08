@@ -91,185 +91,243 @@ func TestDiffSystemAllocsForNode_Sysbatch_terminal(t *testing.T) {
 		diff := diffSystemAllocsForNode(job, "node1", eligible, nil, tainted, required, live, terminal, true)
 		assertDiffCount(t, diffResultCount{update: 1}, diff)
 	})
+
 }
 
-func TestDiffSystemAllocsForNode(t *testing.T) {
-	ci.Parallel(t)
-
-	job := mock.Job()
-	required := materializeSystemTaskGroups(job)
-
-	// The "old" job has a previous modify index
-	oldJob := new(structs.Job)
-	*oldJob = *job
-	oldJob.JobModifyIndex -= 1
-
-	eligibleNode := mock.Node()
-	eligibleNode.ID = "zip"
-
-	drainNode := mock.DrainNode()
-
-	deadNode := mock.Node()
-	deadNode.Status = structs.NodeStatusDown
-
-	tainted := map[string]*structs.Node{
-		"dead":      deadNode,
-		"drainNode": drainNode,
-	}
-
-	eligible := map[string]*structs.Node{
-		eligibleNode.ID: eligibleNode,
-	}
-
-	allocs := []*structs.Allocation{
-		// Update the 1st
-		{
-			ID:     uuid.Generate(),
-			NodeID: "zip",
-			Name:   "my-job.web[0]",
-			Job:    oldJob,
-		},
-
-		// Ignore the 2rd
-		{
-			ID:     uuid.Generate(),
-			NodeID: "zip",
-			Name:   "my-job.web[1]",
-			Job:    job,
-		},
-
-		// Evict 11th
-		{
-			ID:     uuid.Generate(),
-			NodeID: "zip",
-			Name:   "my-job.web[10]",
-			Job:    oldJob,
-		},
-
-		// Migrate the 3rd
-		{
-			ID:     uuid.Generate(),
-			NodeID: "drainNode",
-			Name:   "my-job.web[2]",
-			Job:    oldJob,
-			DesiredTransition: structs.DesiredTransition{
-				Migrate: pointer.Of(true),
-			},
-		},
-		// Mark the 4th lost
-		{
-			ID:     uuid.Generate(),
-			NodeID: "dead",
-			Name:   "my-job.web[3]",
-			Job:    oldJob,
-		},
-	}
-
-	// Have three terminal allocs
-	terminal := structs.TerminalByNodeByName{
-		"zip": map[string]*structs.Allocation{
-			"my-job.web[4]": {
-				ID:     uuid.Generate(),
-				NodeID: "zip",
-				Name:   "my-job.web[4]",
-				Job:    job,
-			},
-			"my-job.web[5]": {
-				ID:     uuid.Generate(),
-				NodeID: "zip",
-				Name:   "my-job.web[5]",
-				Job:    job,
-			},
-			"my-job.web[6]": {
-				ID:     uuid.Generate(),
-				NodeID: "zip",
-				Name:   "my-job.web[6]",
-				Job:    job,
-			},
-		},
-	}
-
-	diff := diffSystemAllocsForNode(job, "zip", eligible, nil, tainted, required, allocs, terminal, true)
-
-	assertDiffCount(t, diffResultCount{
-		update: 1, ignore: 1, stop: 1,
-		migrate: 1, lost: 1, place: 6}, diff)
-
-	// We should update the first alloc
-	require.Equal(t, allocs[0], diff.update[0].Alloc)
-
-	// We should ignore the second alloc
-	require.Equal(t, allocs[1], diff.ignore[0].Alloc)
-
-	// We should stop the 3rd alloc
-	require.Equal(t, allocs[2], diff.stop[0].Alloc)
-
-	// We should migrate the 4rd alloc
-	require.Equal(t, allocs[3], diff.migrate[0].Alloc)
-
-	// We should mark the 5th alloc as lost
-	require.Equal(t, allocs[4], diff.lost[0].Alloc)
-
-	// Ensure that the allocations which are replacements of terminal allocs are
-	// annotated.
-	for _, m := range terminal {
-		for _, alloc := range m {
-			for _, tuple := range diff.place {
-				if alloc.Name == tuple.Name {
-					require.Equal(t, alloc, tuple.Alloc)
-				}
-			}
-		}
-	}
-}
-
-// Test the desired diff for an updated system job running on a
-// ineligible node
-func TestDiffSystemAllocsForNode_ExistingAllocIneligibleNode(t *testing.T) {
+// TestDiffSystemAllocsForNode_Placements verifies we only place on nodes that
+// need placements
+func TestDiffSystemAllocsForNode_Placements(t *testing.T) {
 	ci.Parallel(t)
 
 	job := mock.SystemJob()
 	required := materializeSystemTaskGroups(job)
 
-	// The "old" job has a previous modify index
+	goodNode := mock.Node()
+	unusedNode := mock.Node()
+	drainNode := mock.DrainNode()
+	deadNode := mock.Node()
+	deadNode.Status = structs.NodeStatusDown
+
+	tainted := map[string]*structs.Node{
+		deadNode.ID:  deadNode,
+		drainNode.ID: drainNode,
+	}
+
+	eligible := map[string]*structs.Node{
+		goodNode.ID: goodNode,
+	}
+
+	terminal := structs.TerminalByNodeByName{}
+	allocsForNode := []*structs.Allocation{}
+
+	testCases := []struct {
+		name     string
+		nodeID   string
+		expected diffResultCount
+	}{
+		{
+			name:     "expect placement on good node",
+			nodeID:   goodNode.ID,
+			expected: diffResultCount{place: 1},
+		},
+		{ // "unused" here means outside of the eligible set
+			name:     "expect no placement on unused node",
+			nodeID:   unusedNode.ID,
+			expected: diffResultCount{},
+		},
+		{
+			name:     "expect no placement on dead node",
+			nodeID:   deadNode.ID,
+			expected: diffResultCount{},
+		},
+		{
+			name:     "expect no placement on draining node",
+			nodeID:   drainNode.ID,
+			expected: diffResultCount{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			diff := diffSystemAllocsForNode(
+				job, tc.nodeID, eligible, nil,
+				tainted, required, allocsForNode, terminal, true)
+
+			assertDiffCount(t, tc.expected, diff)
+		})
+	}
+}
+
+// Test the desired diff for an updated system job running on a ineligible node
+func TestDiffSystemAllocsForNode_IneligibleNode(t *testing.T) {
+	ci.Parallel(t)
+
+	job := mock.SystemJob()
+	required := materializeSystemTaskGroups(job)
+
+	ineligibleNode := mock.Node()
+	ineligibleNode.SchedulingEligibility = structs.NodeSchedulingIneligible
+	ineligible := map[string]struct{}{
+		ineligibleNode.ID: {},
+	}
+
+	eligible := map[string]*structs.Node{}
+	tainted := map[string]*structs.Node{}
+
+	terminal := structs.TerminalByNodeByName{
+		ineligibleNode.ID: map[string]*structs.Allocation{
+			"my-job.web[0]": { // terminal allocs should not appear in diff
+				ID:           uuid.Generate(),
+				NodeID:       ineligibleNode.ID,
+				Name:         "my-job.web[0]",
+				Job:          job,
+				ClientStatus: structs.AllocClientStatusComplete,
+			},
+		},
+	}
+
+	testCases := []struct {
+		name   string
+		nodeID string
+		expect diffResultCount
+	}{
+		{
+			name:   "non-terminal alloc on ineligible node should be ignored",
+			nodeID: ineligibleNode.ID,
+			expect: diffResultCount{ignore: 1},
+		},
+		{
+			name:   "non-terminal alloc on node not in eligible set should be stopped",
+			nodeID: uuid.Generate(),
+			expect: diffResultCount{stop: 1},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			alloc := &structs.Allocation{
+				ID:     uuid.Generate(),
+				NodeID: tc.nodeID,
+				Name:   "my-job.web[0]",
+				Job:    job,
+			}
+
+			diff := diffSystemAllocsForNode(
+				job, tc.nodeID, eligible, ineligible, tainted,
+				required, []*structs.Allocation{alloc}, terminal, true,
+			)
+			assertDiffCount(t, tc.expect, diff)
+		})
+	}
+}
+
+func TestDiffSystemAllocsForNode_DrainingNode(t *testing.T) {
+	ci.Parallel(t)
+
+	job := mock.SystemJob()
+	required := materializeSystemTaskGroups(job)
+
+	// The "old" job has a previous modify index but is otherwise unchanged, so
+	// existing non-terminal allocs for this version should be updated in-place
 	oldJob := new(structs.Job)
 	*oldJob = *job
 	oldJob.JobModifyIndex -= 1
 
-	eligibleNode := mock.Node()
-	ineligibleNode := mock.Node()
-	ineligibleNode.SchedulingEligibility = structs.NodeSchedulingIneligible
+	drainNode := mock.DrainNode()
+	tainted := map[string]*structs.Node{
+		drainNode.ID: drainNode,
+	}
 
-	tainted := map[string]*structs.Node{}
-
-	eligible := map[string]*structs.Node{
-		eligibleNode.ID: eligibleNode,
+	// Terminal allocs don't get touched
+	terminal := structs.TerminalByNodeByName{
+		drainNode.ID: map[string]*structs.Allocation{
+			"my-job.web[0]": {
+				ID:           uuid.Generate(),
+				NodeID:       drainNode.ID,
+				Name:         "my-job.web[0]",
+				Job:          job,
+				ClientStatus: structs.AllocClientStatusComplete,
+			},
+		},
 	}
 
 	allocs := []*structs.Allocation{
-		// Update the TG alloc running on eligible node
-		{
+		{ // allocs for draining node should be migrated
 			ID:     uuid.Generate(),
-			NodeID: eligibleNode.ID,
+			NodeID: drainNode.ID,
 			Name:   "my-job.web[0]",
 			Job:    oldJob,
+			DesiredTransition: structs.DesiredTransition{
+				Migrate: pointer.Of(true),
+			},
 		},
-
-		// Ignore the TG alloc running on ineligible node
-		{
+		{ // allocs not marked for drain should be ignored
 			ID:     uuid.Generate(),
-			NodeID: ineligibleNode.ID,
+			NodeID: drainNode.ID,
 			Name:   "my-job.web[0]",
 			Job:    job,
 		},
 	}
 
-	// No terminal allocs
-	terminal := make(structs.TerminalByNodeByName)
+	diff := diffSystemAllocsForNode(
+		job, drainNode.ID, map[string]*structs.Node{}, nil,
+		tainted, required, allocs, terminal, true)
 
-	diff := diffSystemAllocsForNode(job, eligibleNode.ID, eligible, nil, tainted, required, allocs, terminal, true)
+	assertDiffCount(t, diffResultCount{migrate: 1, ignore: 1}, diff)
+	if len(diff.migrate) > 0 {
+		test.Eq(t, allocs[0], diff.migrate[0].Alloc)
+	}
+}
 
-	assertDiffCount(t, diffResultCount{update: 1, ignore: 1}, diff)
+func TestDiffSystemAllocsForNode_LostNode(t *testing.T) {
+	ci.Parallel(t)
+
+	job := mock.SystemJob()
+	required := materializeSystemTaskGroups(job)
+
+	// The "old" job has a previous modify index but is otherwise unchanged, so
+	// existing non-terminal allocs for this version should be updated in-place
+	oldJob := new(structs.Job)
+	*oldJob = *job
+	oldJob.JobModifyIndex -= 1
+
+	deadNode := mock.Node()
+	deadNode.Status = structs.NodeStatusDown
+
+	tainted := map[string]*structs.Node{
+		deadNode.ID: deadNode,
+	}
+
+	allocs := []*structs.Allocation{
+		{ // current allocs on a lost node are lost, even if terminal
+			ID:     uuid.Generate(),
+			NodeID: deadNode.ID,
+			Name:   "my-job.web[0]",
+			Job:    job,
+		},
+		{ // old allocs on a lost node are also lost
+			ID:     uuid.Generate(),
+			NodeID: deadNode.ID,
+			Name:   "my-job.web[0]",
+			Job:    oldJob,
+		},
+	}
+
+	// Terminal allocs don't get touched
+	terminal := structs.TerminalByNodeByName{
+		deadNode.ID: map[string]*structs.Allocation{
+			"my-job.web[0]": allocs[0],
+		},
+	}
+
+	diff := diffSystemAllocsForNode(
+		job, deadNode.ID, map[string]*structs.Node{}, nil,
+		tainted, required, allocs, terminal, true)
+
+	assertDiffCount(t, diffResultCount{lost: 2}, diff)
+	if len(diff.migrate) > 0 {
+		test.Eq(t, allocs[0], diff.migrate[0].Alloc)
+	}
 }
 
 func TestDiffSystemAllocsForNode_DisconnectedNode(t *testing.T) {
@@ -394,6 +452,8 @@ func TestDiffSystemAllocsForNode_DisconnectedNode(t *testing.T) {
 	}
 }
 
+// TestDiffSystemAllocs is a higher-level test of interactions of diffs across
+// multiple nodes.
 func TestDiffSystemAllocs(t *testing.T) {
 	ci.Parallel(t)
 

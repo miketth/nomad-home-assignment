@@ -8,13 +8,15 @@ package scheduler
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
-// materializeSystemTaskGroups is used to materialize all the task groups
-// a system or sysbatch job requires.
+// materializeSystemTaskGroups is used to materialize all the task groups a
+// system or sysbatch job requires. Returns a map of allocation names to task
+// groups.
 func materializeSystemTaskGroups(job *structs.Job) map[string]*structs.TaskGroup {
 	out := make(map[string]*structs.TaskGroup)
 	if job.Stopped() {
@@ -22,10 +24,10 @@ func materializeSystemTaskGroups(job *structs.Job) map[string]*structs.TaskGroup
 	}
 
 	for _, tg := range job.TaskGroups {
-		for i := 0; i < tg.Count; i++ {
-			name := fmt.Sprintf("%s.%s[%d]", job.Name, tg.Name, i)
-			out[name] = tg
-		}
+		// note that all system/sysbatch allocs for the same task group share
+		// the same alloc index 0
+		name := fmt.Sprintf("%s.%s[0]", job.Name, tg.Name)
+		out[name] = tg
 	}
 	return out
 }
@@ -45,7 +47,7 @@ func diffSystemAllocsForNode(
 	eligibleNodes map[string]*structs.Node,
 	notReadyNodes map[string]struct{}, // nodes that are not ready, e.g. draining
 	taintedNodes map[string]*structs.Node, // nodes which are down (by node id)
-	required map[string]*structs.TaskGroup, // set of allocations that must exist
+	required map[string]*structs.TaskGroup, // set of task groups (by name) that must exist
 	allocs []*structs.Allocation, // non-terminal allocations that exist
 	terminal structs.TerminalByNodeByName, // latest terminal allocations (by node, id)
 	serverSupportsDisconnectedClients bool, // flag indicating whether to apply disconnected client logic
@@ -62,7 +64,7 @@ func diffSystemAllocsForNode(
 		// Check for the definition in the required set
 		tg, ok := required[name]
 
-		// If not required, we stop the alloc
+		// If task group is no longer required, we stop the alloc
 		if !ok {
 			result.stop = append(result.stop, allocTuple{
 				Name:      name,
@@ -304,15 +306,15 @@ func diffSystemAllocs(
 ) *diffResult {
 
 	// Build a mapping of nodes to all their allocs.
-	nodeAllocs := make(map[string][]*structs.Allocation, len(allocs))
+	allocsByNode := make(map[string][]*structs.Allocation, len(allocs))
 	for _, alloc := range allocs {
-		nodeAllocs[alloc.NodeID] = append(nodeAllocs[alloc.NodeID], alloc)
+		allocsByNode[alloc.NodeID] = append(allocsByNode[alloc.NodeID], alloc)
 	}
 
 	eligibleNodes := make(map[string]*structs.Node)
 	for _, node := range readyNodes {
-		if _, ok := nodeAllocs[node.ID]; !ok {
-			nodeAllocs[node.ID] = nil
+		if _, ok := allocsByNode[node.ID]; !ok {
+			allocsByNode[node.ID] = nil
 		}
 		eligibleNodes[node.ID] = node
 	}
@@ -321,8 +323,8 @@ func diffSystemAllocs(
 	required := materializeSystemTaskGroups(job)
 
 	result := new(diffResult)
-	for nodeID, allocs := range nodeAllocs {
-		diff := diffSystemAllocsForNode(job, nodeID, eligibleNodes, notReadyNodes, taintedNodes, required, allocs, terminal, serverSupportsDisconnectedClients)
+	for nodeID, allocsForNode := range allocsByNode {
+		diff := diffSystemAllocsForNode(job, nodeID, eligibleNodes, notReadyNodes, taintedNodes, required, allocsForNode, terminal, serverSupportsDisconnectedClients)
 		result.Append(diff)
 	}
 
