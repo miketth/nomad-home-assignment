@@ -5,7 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/shoenig/test"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 
 	"github.com/hashicorp/nomad/ci"
@@ -14,6 +15,23 @@ import (
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
+
+// diffResultCount is a test helper struct that makes it easier to specify an
+// expected diff
+type diffResultCount struct {
+	place, update, migrate, stop, ignore, lost, disconnecting, reconnecting int
+}
+
+// assertDiffCount is a test helper that compares against a diffResult
+func assertDiffCount(t *testing.T, expected diffResultCount, diff *diffResult) {
+	t.Helper()
+	test.Len(t, expected.update, diff.update, test.Sprintf("expected update"))
+	test.Len(t, expected.ignore, diff.ignore, test.Sprintf("expected ignore"))
+	test.Len(t, expected.stop, diff.stop, test.Sprintf("expected stop"))
+	test.Len(t, expected.migrate, diff.migrate, test.Sprintf("expected migrate"))
+	test.Len(t, expected.lost, diff.lost, test.Sprintf("expected lost"))
+	test.Len(t, expected.place, diff.place, test.Sprintf("expected place"))
+}
 
 func TestDiffSystemAllocsForNode_Sysbatch_terminal(t *testing.T) {
 	ci.Parallel(t)
@@ -46,12 +64,11 @@ func TestDiffSystemAllocsForNode_Sysbatch_terminal(t *testing.T) {
 		}
 
 		diff := diffSystemAllocsForNode(job, "node1", eligible, nil, tainted, required, live, terminal, true)
-		require.Empty(t, diff.place)
-		require.Empty(t, diff.update)
-		require.Empty(t, diff.stop)
-		require.Empty(t, diff.migrate)
-		require.Empty(t, diff.lost)
-		require.True(t, len(diff.ignore) == 1 && diff.ignore[0].Alloc == terminal["node1"]["my-sysbatch.pinger[0]"])
+
+		assertDiffCount(t, diffResultCount{ignore: 1}, diff)
+		if len(diff.ignore) > 0 {
+			must.Eq(t, terminal["node1"]["my-sysbatch.pinger[0]"], diff.ignore[0].Alloc)
+		}
 	})
 
 	t.Run("outdated job", func(t *testing.T) {
@@ -72,12 +89,7 @@ func TestDiffSystemAllocsForNode_Sysbatch_terminal(t *testing.T) {
 		expAlloc.NodeID = "node1"
 
 		diff := diffSystemAllocsForNode(job, "node1", eligible, nil, tainted, required, live, terminal, true)
-		require.Empty(t, diff.place)
-		require.Len(t, diff.update, 1)
-		require.Empty(t, diff.stop)
-		require.Empty(t, diff.migrate)
-		require.Empty(t, diff.lost)
-		require.Empty(t, diff.ignore)
+		assertDiffCount(t, diffResultCount{update: 1}, diff)
 	})
 }
 
@@ -179,28 +191,24 @@ func TestDiffSystemAllocsForNode(t *testing.T) {
 
 	diff := diffSystemAllocsForNode(job, "zip", eligible, nil, tainted, required, allocs, terminal, true)
 
+	assertDiffCount(t, diffResultCount{
+		update: 1, ignore: 1, stop: 1,
+		migrate: 1, lost: 1, place: 6}, diff)
+
 	// We should update the first alloc
-	require.Len(t, diff.update, 1)
 	require.Equal(t, allocs[0], diff.update[0].Alloc)
 
 	// We should ignore the second alloc
-	require.Len(t, diff.ignore, 1)
 	require.Equal(t, allocs[1], diff.ignore[0].Alloc)
 
 	// We should stop the 3rd alloc
-	require.Len(t, diff.stop, 1)
 	require.Equal(t, allocs[2], diff.stop[0].Alloc)
 
 	// We should migrate the 4rd alloc
-	require.Len(t, diff.migrate, 1)
 	require.Equal(t, allocs[3], diff.migrate[0].Alloc)
 
 	// We should mark the 5th alloc as lost
-	require.Len(t, diff.lost, 1)
 	require.Equal(t, allocs[4], diff.lost[0].Alloc)
-
-	// We should place 6
-	require.Len(t, diff.place, 6)
 
 	// Ensure that the allocations which are replacements of terminal allocs are
 	// annotated.
@@ -261,12 +269,7 @@ func TestDiffSystemAllocsForNode_ExistingAllocIneligibleNode(t *testing.T) {
 
 	diff := diffSystemAllocsForNode(job, eligibleNode.ID, eligible, nil, tainted, required, allocs, terminal, true)
 
-	require.Len(t, diff.place, 0)
-	require.Len(t, diff.update, 1)
-	require.Len(t, diff.migrate, 0)
-	require.Len(t, diff.stop, 0)
-	require.Len(t, diff.ignore, 1)
-	require.Len(t, diff.lost, 0)
+	assertDiffCount(t, diffResultCount{update: 1, ignore: 1}, diff)
 }
 
 func TestDiffSystemAllocsForNode_DisconnectedNode(t *testing.T) {
@@ -295,10 +298,6 @@ func TestDiffSystemAllocsForNode_DisconnectedNode(t *testing.T) {
 	required := materializeSystemTaskGroups(job)
 	terminal := make(structs.TerminalByNodeByName)
 
-	type diffResultCount struct {
-		place, update, migrate, stop, ignore, lost, disconnecting, reconnecting int
-	}
-
 	testCases := []struct {
 		name    string
 		node    *structs.Node
@@ -311,25 +310,20 @@ func TestDiffSystemAllocsForNode_DisconnectedNode(t *testing.T) {
 			allocFn: func(alloc *structs.Allocation) {
 				alloc.ClientStatus = structs.AllocClientStatusRunning
 			},
-			expect: diffResultCount{
-				disconnecting: 1,
-			},
+			expect: diffResultCount{disconnecting: 1},
 		},
 		{
 			name: "disconnected alloc reconnects",
 			node: readyNode,
 			allocFn: func(alloc *structs.Allocation) {
 				alloc.ClientStatus = structs.AllocClientStatusRunning
-
 				alloc.AllocStates = []*structs.AllocState{{
 					Field: structs.AllocStateFieldClientStatus,
 					Value: structs.AllocClientStatusUnknown,
 					Time:  time.Now().Add(-time.Minute),
 				}}
 			},
-			expect: diffResultCount{
-				reconnecting: 1,
-			},
+			expect: diffResultCount{reconnecting: 1},
 		},
 		{
 			name: "alloc not reconnecting after it reconnects",
@@ -350,41 +344,33 @@ func TestDiffSystemAllocsForNode_DisconnectedNode(t *testing.T) {
 					},
 				}
 			},
-			expect: diffResultCount{
-				ignore: 1,
-			},
+			expect: diffResultCount{ignore: 1},
 		},
 		{
 			name: "disconnected alloc is lost after it expires",
 			node: disconnectedNode,
 			allocFn: func(alloc *structs.Allocation) {
 				alloc.ClientStatus = structs.AllocClientStatusUnknown
-
 				alloc.AllocStates = []*structs.AllocState{{
 					Field: structs.AllocStateFieldClientStatus,
 					Value: structs.AllocClientStatusUnknown,
 					Time:  time.Now().Add(-10 * time.Hour),
 				}}
 			},
-			expect: diffResultCount{
-				lost: 1,
-			},
+			expect: diffResultCount{lost: 1},
 		},
 		{
 			name: "disconnected allocs are ignored",
 			node: disconnectedNode,
 			allocFn: func(alloc *structs.Allocation) {
 				alloc.ClientStatus = structs.AllocClientStatusUnknown
-
 				alloc.AllocStates = []*structs.AllocState{{
 					Field: structs.AllocStateFieldClientStatus,
 					Value: structs.AllocClientStatusUnknown,
 					Time:  time.Now(),
 				}}
 			},
-			expect: diffResultCount{
-				ignore: 1,
-			},
+			expect: diffResultCount{ignore: 1},
 		},
 	}
 
@@ -403,15 +389,7 @@ func TestDiffSystemAllocsForNode_DisconnectedNode(t *testing.T) {
 				job, tc.node.ID, eligibleNodes, nil, taintedNodes,
 				required, []*structs.Allocation{alloc}, terminal, true,
 			)
-
-			assert.Len(t, got.place, tc.expect.place, "place")
-			assert.Len(t, got.update, tc.expect.update, "update")
-			assert.Len(t, got.migrate, tc.expect.migrate, "migrate")
-			assert.Len(t, got.stop, tc.expect.stop, "stop")
-			assert.Len(t, got.ignore, tc.expect.ignore, "ignore")
-			assert.Len(t, got.lost, tc.expect.lost, "lost")
-			assert.Len(t, got.disconnecting, tc.expect.disconnecting, "disconnecting")
-			assert.Len(t, got.reconnecting, tc.expect.reconnecting, "reconnecting")
+			assertDiffCount(t, tc.expect, got)
 		})
 	}
 }
@@ -490,27 +468,21 @@ func TestDiffSystemAllocs(t *testing.T) {
 
 	diff := diffSystemAllocs(job, nodes, nil, tainted, allocs, terminal, true)
 
-	// We should update the first alloc
-	require.Len(t, diff.update, 1)
-	require.Equal(t, allocs[0], diff.update[0].Alloc)
+	assertDiffCount(t, diffResultCount{
+		update: 1, ignore: 1, migrate: 1, lost: 1, place: 2}, diff)
 
-	// We should ignore the second alloc
-	require.Len(t, diff.ignore, 1)
-	require.Equal(t, allocs[1], diff.ignore[0].Alloc)
-
-	// We should stop the third alloc
-	require.Empty(t, diff.stop)
-
-	// There should be no migrates.
-	require.Len(t, diff.migrate, 1)
-	require.Equal(t, allocs[2], diff.migrate[0].Alloc)
-
-	// We should mark the 5th alloc as lost
-	require.Len(t, diff.lost, 1)
-	require.Equal(t, allocs[3], diff.lost[0].Alloc)
-
-	// We should place 2
-	require.Len(t, diff.place, 2)
+	if len(diff.update) > 0 {
+		must.Eq(t, allocs[0], diff.update[0].Alloc) // first alloc should be updated
+	}
+	if len(diff.ignore) > 0 {
+		must.Eq(t, allocs[1], diff.ignore[0].Alloc) // We should ignore the second alloc
+	}
+	if len(diff.migrate) > 0 {
+		must.Eq(t, allocs[2], diff.migrate[0].Alloc)
+	}
+	if len(diff.lost) > 0 {
+		must.Eq(t, allocs[3], diff.lost[0].Alloc) // We should mark the 5th alloc as lost
+	}
 
 	// Ensure that the allocations which are replacements of terminal allocs are
 	// annotated.
