@@ -158,6 +158,67 @@ func TestDiffSystemAllocsForNode_Placements(t *testing.T) {
 	}
 }
 
+// TestDiffSystemAllocsForNodes_Stops verifies we stop allocs we no longer need
+func TestDiffSystemAllocsForNode_Stops(t *testing.T) {
+	ci.Parallel(t)
+
+	job := mock.SystemJob()
+	required := materializeSystemTaskGroups(job)
+
+	// The "old" job has a previous modify index but is otherwise unchanged, so
+	// existing non-terminal allocs for this version should be updated in-place
+	// *unless* there's another alloc for the same job already on the node
+	oldJob := new(structs.Job)
+	*oldJob = *job
+	oldJob.JobModifyIndex -= 1
+
+	node := mock.Node()
+
+	eligible := map[string]*structs.Node{
+		node.ID: node,
+	}
+
+	allocs := []*structs.Allocation{
+		{ // extraneous alloc for old version of job should be stopped
+			ID:     uuid.Generate(),
+			NodeID: node.ID,
+			Name:   "my-job.web[0]",
+			Job:    oldJob,
+		},
+		{ // extraneous alloc for current version of job should be stopped
+			ID:          uuid.Generate(),
+			NodeID:      node.ID,
+			Name:        "my-job.web[0]",
+			Job:         job,
+			CreateIndex: 1000,
+		},
+		{ // most recent alloc for current version of job should be ignored
+			ID:          uuid.Generate(),
+			NodeID:      node.ID,
+			Name:        "my-job.web[0]",
+			Job:         job,
+			CreateIndex: 1001,
+		},
+		{ // task group not required, should be stopped
+			ID:     uuid.Generate(),
+			NodeID: node.ID,
+			Name:   "my-job.something-else[0]",
+			Job:    job,
+		},
+	}
+
+	tainted := map[string]*structs.Node{}
+	terminal := structs.TerminalByNodeByName{}
+
+	diff := diffSystemAllocsForNode(
+		job, node.ID, eligible, nil, tainted, required, allocs, terminal, true)
+
+	assertDiffCount(t, diffResultCount{ignore: 1, stop: 3}, diff)
+	if len(diff.ignore) > 0 {
+		test.Eq(t, allocs[2], diff.ignore[0].Alloc)
+	}
+}
+
 // Test the desired diff for an updated system job running on a ineligible node
 func TestDiffSystemAllocsForNode_IneligibleNode(t *testing.T) {
 	ci.Parallel(t)
@@ -609,4 +670,77 @@ func TestEvictAndPlace_LimitGreaterThanAllocs(t *testing.T) {
 	require.False(t, evictAndPlace(ctx, diff, allocs, "", &limit))
 	require.Equal(t, 2, limit, "evictAndReplace() should decremented limit")
 	require.Equal(t, 4, len(diff.place), "evictAndReplace() didn't insert into diffResult properly: %v", diff.place)
+}
+
+func TestEnsureSingleSystemAlloc(t *testing.T) {
+	ci.Parallel(t)
+
+	job := mock.SystemJob()
+	oldJob := new(structs.Job)
+	*oldJob = *job
+	oldJob.JobModifyIndex -= 1
+
+	t.Run("keep more recent same version for ignore", func(t *testing.T) {
+		keep := &structs.Allocation{ID: "newer", Job: job, CreateIndex: 1001}
+		diff := &diffResult{
+			ignore: []allocTuple{
+				{Alloc: &structs.Allocation{ID: "older", Job: job, CreateIndex: 1000}},
+				{Alloc: keep},
+			},
+			update: []allocTuple{
+				{Alloc: &structs.Allocation{ID: "update", Job: job}},
+			},
+			reconnecting: []allocTuple{
+				{Alloc: &structs.Allocation{ID: "reconnecting", Job: job}},
+			},
+		}
+		ensureSingleSystemAlloc(diff)
+		assertDiffCount(t, diffResultCount{ignore: 1, stop: 3}, diff)
+		must.Eq(t, keep, diff.ignore[0].Alloc)
+	})
+
+	t.Run("keep newer version for ignore", func(t *testing.T) {
+		keep := &structs.Allocation{ID: "newer", Job: job}
+		diff := &diffResult{
+			ignore: []allocTuple{
+				{Alloc: &structs.Allocation{ID: "older", Job: oldJob}},
+				{Alloc: keep},
+			},
+			update:       []allocTuple{},
+			reconnecting: []allocTuple{},
+		}
+		ensureSingleSystemAlloc(diff)
+		assertDiffCount(t, diffResultCount{ignore: 1, stop: 1}, diff)
+		must.Eq(t, keep, diff.ignore[0].Alloc)
+	})
+
+	t.Run("keep newer version for update", func(t *testing.T) {
+		keep := &structs.Allocation{ID: "newer", Job: job}
+		diff := &diffResult{
+			update: []allocTuple{
+				{Alloc: &structs.Allocation{ID: "older", Job: oldJob}},
+				{Alloc: keep},
+			},
+			reconnecting: []allocTuple{
+				{Alloc: &structs.Allocation{ID: "reconnect", Job: job}},
+			},
+		}
+		ensureSingleSystemAlloc(diff)
+		assertDiffCount(t, diffResultCount{update: 1, stop: 2}, diff)
+		must.Eq(t, keep, diff.update[0].Alloc)
+	})
+
+	t.Run("keep newer version for reconnect", func(t *testing.T) {
+		keep := &structs.Allocation{ID: "newer", Job: job}
+		diff := &diffResult{
+			reconnecting: []allocTuple{
+				{Alloc: &structs.Allocation{ID: "older", Job: oldJob}},
+				{Alloc: keep},
+			},
+		}
+		ensureSingleSystemAlloc(diff)
+		assertDiffCount(t, diffResultCount{reconnecting: 1, stop: 1}, diff)
+		must.Eq(t, keep, diff.reconnecting[0].Alloc)
+	})
+
 }

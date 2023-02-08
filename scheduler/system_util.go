@@ -100,16 +100,6 @@ func diffSystemAllocsForNode(
 			continue
 		}
 
-		// If we are a sysbatch job and terminal, ignore (or stop?) the alloc
-		if job.Type == structs.JobTypeSysBatch && exist.TerminalStatus() {
-			result.ignore = append(result.ignore, allocTuple{
-				Name:      name,
-				TaskGroup: tg,
-				Alloc:     exist,
-			})
-			continue
-		}
-
 		// Expired unknown allocs are lost. Expired checks that status is unknown.
 		if supportsDisconnectedClients && expired {
 			result.lost = append(result.lost, allocTuple{
@@ -154,11 +144,12 @@ func diffSystemAllocsForNode(
 		// If we are on a tainted node, we must migrate if we are a service or
 		// if the batch allocation did not finish
 		if nodeIsTainted {
-			// If the job is batch and finished successfully, the fact that the
-			// node is tainted does not mean it should be migrated or marked as
-			// lost as the work was already successfully finished. However for
-			// service/system jobs, tasks should never complete. The check of
-			// batch type, defends against client bugs.
+			// If the job is batch and finished successfully (but not yet marked
+			// terminal), the fact that the node is tainted does not mean it
+			// should be migrated or marked as lost as the work was already
+			// successfully finished. However for service/system jobs, tasks
+			// should never complete. The check of batch type, defends against
+			// client bugs.
 			if exist.Job.Type == structs.JobTypeSysBatch && exist.RanSuccessfully() {
 				goto IGNORE
 			}
@@ -230,6 +221,9 @@ func diffSystemAllocsForNode(
 		})
 	}
 
+	// Stop any extraneous allocations
+	ensureSingleSystemAlloc(result)
+
 	// Scan the required groups
 	for name, tg := range required {
 
@@ -291,6 +285,64 @@ func diffSystemAllocsForNode(
 		}
 	}
 	return result
+}
+
+// ensureSingleSystemAlloc enforces the invariant that a system or sysbatch job
+// should never have more than one allocation in a desired-running state.
+func ensureSingleSystemAlloc(result *diffResult) {
+
+	if len(result.ignore)+len(result.update)+len(result.reconnecting) <= 1 {
+		return
+	}
+
+	// sort by JobModifyIndex, then CreateIndex
+	sortTuples := func(tuples []allocTuple) {
+		sort.Slice(tuples, func(i, j int) bool {
+			if tuples[i].Alloc.Job.JobModifyIndex == tuples[j].Alloc.Job.JobModifyIndex {
+				return tuples[i].Alloc.CreateIndex > tuples[j].Alloc.CreateIndex
+			}
+			return tuples[i].Alloc.Job.JobModifyIndex > tuples[j].Alloc.Job.JobModifyIndex
+		})
+	}
+
+	// ignored allocs are current, so pick the most recent one and stop all the
+	// rest of the running allocs on the node
+	if len(result.ignore) > 0 {
+		if len(result.ignore) > 1 {
+			sortTuples(result.ignore)
+			result.stop = append(result.stop, result.ignore[1:]...)
+			result.ignore = []allocTuple{result.ignore[0]}
+		}
+		result.stop = append(result.stop, result.update...)
+		result.stop = append(result.stop, result.reconnecting...)
+		result.update = []allocTuple{}
+		result.reconnecting = []allocTuple{}
+		return
+	}
+
+	// updated allocs are for in-place updates of the job (ex. bumping the
+	// version for a constraints update), so we can pick the most recent one and
+	// stop all the rest of the running allocs on the node
+	if len(result.update) > 0 {
+		if len(result.update) > 1 {
+			sortTuples(result.update)
+			result.stop = append(result.stop, result.update[1:]...)
+			result.update = []allocTuple{result.update[0]}
+		}
+		result.stop = append(result.stop, result.reconnecting...)
+		result.reconnecting = []allocTuple{}
+		return
+	}
+
+	// reconnecting allocs are for when a node reconnects after being lost with
+	// running allocs. we should only see this case if we got out of sync but
+	// never got a chance to eval before the node disconnected. clean up the
+	// remaining mess.
+	if len(result.reconnecting) > 1 {
+		sortTuples(result.reconnecting)
+		result.stop = append(result.stop, result.reconnecting[1:]...)
+		result.reconnecting = []allocTuple{result.reconnecting[0]}
+	}
 }
 
 // diffSystemAllocs is like diffSystemAllocsForNode however, the allocations in the
