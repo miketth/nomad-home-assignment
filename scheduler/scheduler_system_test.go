@@ -3095,6 +3095,9 @@ func TestSystemSched_OverlappingAllocations(t *testing.T) {
 	node.Name = "good-node-1"
 	must.NoError(t, h.State.UpsertNode(structs.MsgTypeTestSetup, h.NextIndex(), node))
 
+	// Create 2 allocs for 2 versions of the same system job on the same node.
+	// This should not happen but has been observed, so the scheduler must "fix"
+	// this by stopping the old version.
 	oldJob := mock.SystemJob()
 	oldJob.ID = "my-job"
 	must.NoError(t, h.State.UpsertJob(structs.MsgTypeTestSetup, h.NextIndex(), oldJob))

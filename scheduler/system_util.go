@@ -295,13 +295,17 @@ func ensureSingleSystemAlloc(result *diffResult) {
 		return
 	}
 
-	// sort by JobModifyIndex, then CreateIndex
+	// sort descending by JobModifyIndex, then CreateIndex. The inputs are the
+	// ignore/update/reconnecting allocations that were assigned to a single
+	// node, so that constrains the size of these slices and sorting won't be
+	// too expensive
 	sortTuples := func(tuples []allocTuple) {
 		sort.Slice(tuples, func(i, j int) bool {
-			if tuples[i].Alloc.Job.JobModifyIndex == tuples[j].Alloc.Job.JobModifyIndex {
-				return tuples[i].Alloc.CreateIndex > tuples[j].Alloc.CreateIndex
+			I, J := tuples[i].Alloc, tuples[j].Alloc
+			if I.Job.JobModifyIndex == J.Job.JobModifyIndex {
+				return I.CreateIndex > J.CreateIndex
 			}
-			return tuples[i].Alloc.Job.JobModifyIndex > tuples[j].Alloc.Job.JobModifyIndex
+			return I.Job.JobModifyIndex > J.Job.JobModifyIndex
 		})
 	}
 

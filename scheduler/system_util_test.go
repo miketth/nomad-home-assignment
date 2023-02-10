@@ -85,9 +85,6 @@ func TestDiffSystemAllocsForNode_Sysbatch_terminal(t *testing.T) {
 			},
 		}
 
-		expAlloc := terminal["node1"]["my-sysbatch.pinger[0]"]
-		expAlloc.NodeID = "node1"
-
 		diff := diffSystemAllocsForNode(job, "node1", eligible, nil, tainted, required, live, terminal, true)
 		assertDiffCount(t, diffResultCount{update: 1}, diff)
 	})
