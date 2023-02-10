@@ -90,8 +90,8 @@ func diffSystemAllocsForNode(
 			}
 		}
 
-		// If we have been marked for migration and aren't terminal, migrate
-		if !exist.TerminalStatus() && exist.DesiredTransition.ShouldMigrate() {
+		// If we have been marked for migration, migrate
+		if exist.DesiredTransition.ShouldMigrate() {
 			result.migrate = append(result.migrate, allocTuple{
 				Name:      name,
 				TaskGroup: tg,
