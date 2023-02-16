@@ -24,10 +24,14 @@ func materializeSystemTaskGroups(job *structs.Job) map[string]*structs.TaskGroup
 	}
 
 	for _, tg := range job.TaskGroups {
-		// note that all system/sysbatch allocs for the same task group share
-		// the same alloc index 0
-		name := fmt.Sprintf("%s.%s[0]", job.Name, tg.Name)
-		out[name] = tg
+		count := tg.Count
+		if job.Type == structs.JobTypeSystem {
+			count = 1 // system jobs don't accept a count
+		}
+		for i := 0; i < count; i++ {
+			name := fmt.Sprintf("%s.%s[%d]", job.Name, tg.Name, i)
+			out[name] = tg
+		}
 	}
 	return out
 }
@@ -47,24 +51,34 @@ func diffSystemAllocsForNode(
 	eligibleNodes map[string]*structs.Node,
 	notReadyNodes map[string]struct{}, // nodes that are not ready, e.g. draining
 	taintedNodes map[string]*structs.Node, // nodes which are down (by node id)
-	required map[string]*structs.TaskGroup, // set of task groups (by name) that must exist
+	required map[string]*structs.TaskGroup, // set of task groups (by alloc name) that must exist
 	allocs []*structs.Allocation, // non-terminal allocations that exist
 	terminal structs.TerminalByNodeByName, // latest terminal allocations (by node, id)
 	serverSupportsDisconnectedClients bool, // flag indicating whether to apply disconnected client logic
 ) *diffResult {
-	result := new(diffResult)
 
-	// Scan the existing updates
-	existing := make(map[string]struct{}) // set of alloc names
+	// Track a map of task group names (both those required and not) to
+	// diffResult for allocations of that name. This lets us enforce task-group
+	// global invariants before we merge all the results together for the node.
+	results := map[string]*diffResult{}
+
+	// Track the set of allocation names we've
+	// seen, so we can determine if new placements are needed.
+	existing := make(map[string]struct{})
+
 	for _, exist := range allocs {
-		// Index the existing node
 		name := exist.Name
 		existing[name] = struct{}{}
 
-		// Check for the definition in the required set
-		tg, ok := required[name]
+		result := results[name]
+		if result == nil {
+			result = new(diffResult)
+			results[name] = result
+		}
 
-		// If task group is no longer required, we stop the alloc
+		// Check if the allocation's task group is in the required set (it might
+		// have been dropped from the jobspec). If not, we stop the alloc
+		tg, ok := required[name]
 		if !ok {
 			result.stop = append(result.stop, allocTuple{
 				Name:      name,
@@ -110,19 +124,14 @@ func diffSystemAllocsForNode(
 			continue
 		}
 
+		taintedNode, nodeIsTainted := taintedNodes[exist.NodeID]
+
 		// Ignore unknown allocs that we want to reconnect eventually.
 		if supportsDisconnectedClients &&
 			exist.ClientStatus == structs.AllocClientStatusUnknown &&
 			exist.DesiredStatus == structs.AllocDesiredStatusRun {
-			result.ignore = append(result.ignore, allocTuple{
-				Name:      name,
-				TaskGroup: tg,
-				Alloc:     exist,
-			})
-			continue
+			goto IGNORE
 		}
-
-		node, nodeIsTainted := taintedNodes[exist.NodeID]
 
 		// Filter allocs on a node that is now re-connected to reconnecting.
 		if supportsDisconnectedClients &&
@@ -155,9 +164,9 @@ func diffSystemAllocsForNode(
 			}
 
 			// Filter running allocs on a node that is disconnected to be marked as unknown.
-			if node != nil &&
+			if taintedNode != nil &&
 				supportsDisconnectedClients &&
-				node.Status == structs.NodeStatusDisconnected &&
+				taintedNode.Status == structs.NodeStatusDisconnected &&
 				exist.ClientStatus == structs.AllocClientStatusRunning {
 
 				disconnect := exist.Copy()
@@ -172,7 +181,7 @@ func diffSystemAllocsForNode(
 				continue
 			}
 
-			if !exist.TerminalStatus() && (node == nil || node.TerminalStatus()) {
+			if taintedNode == nil || taintedNode.TerminalStatus() {
 				result.lost = append(result.lost, allocTuple{
 					Name:      name,
 					TaskGroup: tg,
@@ -219,16 +228,32 @@ func diffSystemAllocsForNode(
 			TaskGroup: tg,
 			Alloc:     exist,
 		})
-	}
 
-	// Stop any extraneous allocations
-	ensureSingleSystemAlloc(result)
+	}
 
 	// Scan the required groups
 	for name, tg := range required {
 
+		result := results[name]
+		if result == nil {
+			result = new(diffResult)
+			results[name] = result
+		}
+
 		// Check for an existing allocation
-		if _, ok := existing[name]; !ok {
+		if _, ok := existing[name]; ok {
+
+			// Assert that we don't have any extraneous allocations for this
+			// task group
+			count := tg.Count
+			if count == 0 {
+				count = 1
+			}
+			if len(result.ignore)+len(result.update)+len(result.reconnecting) > count {
+				ensureMaxSystemAllocCount(result, count)
+			}
+
+		} else {
 
 			// Check for a terminal sysbatch allocation, which should be not placed
 			// again unless the job has been updated.
@@ -284,21 +309,24 @@ func diffSystemAllocsForNode(
 			result.place = append(result.place, allocTuple)
 		}
 	}
-	return result
-}
 
-// ensureSingleSystemAlloc enforces the invariant that a system or sysbatch job
-// should never have more than one allocation in a desired-running state.
-func ensureSingleSystemAlloc(result *diffResult) {
-
-	if len(result.ignore)+len(result.update)+len(result.reconnecting) <= 1 {
-		return
+	finalResult := new(diffResult)
+	for _, result := range results {
+		finalResult.Append(result)
 	}
 
-	// sort descending by JobModifyIndex, then CreateIndex. The inputs are the
-	// ignore/update/reconnecting allocations that were assigned to a single
-	// node, so that constrains the size of these slices and sorting won't be
-	// too expensive
+	return finalResult
+}
+
+// ensureMaxSystemAllocCount enforces the invariant that the per-node diffResult
+// we have for a system or sysbatch job should never have more than "count"
+// allocations in a desired-running state.
+func ensureMaxSystemAllocCount(result *diffResult, count int) {
+
+	// sort descending by TaskGroup name, then JobModifyIndex, then
+	// CreateIndex. The inputs are the ignore/update/reconnecting allocations
+	// that were assigned to a single node, so that constrains the size of these
+	// slices and sorting won't be too expensive
 	sortTuples := func(tuples []allocTuple) {
 		sort.Slice(tuples, func(i, j int) bool {
 			I, J := tuples[i].Alloc, tuples[j].Alloc
@@ -312,40 +340,46 @@ func ensureSingleSystemAlloc(result *diffResult) {
 	// ignored allocs are current, so pick the most recent one and stop all the
 	// rest of the running allocs on the node
 	if len(result.ignore) > 0 {
-		if len(result.ignore) > 1 {
+		if len(result.ignore) > count {
 			sortTuples(result.ignore)
-			result.stop = append(result.stop, result.ignore[1:]...)
-			result.ignore = []allocTuple{result.ignore[0]}
+			result.stop = append(result.stop, result.ignore[count:]...)
+			result.ignore = result.ignore[:count]
 		}
-		result.stop = append(result.stop, result.update...)
-		result.stop = append(result.stop, result.reconnecting...)
-		result.update = []allocTuple{}
-		result.reconnecting = []allocTuple{}
-		return
+		count = count - len(result.ignore) // reduce the remaining count
+		if count < 1 {
+			result.stop = append(result.stop, result.update...)
+			result.stop = append(result.stop, result.reconnecting...)
+			result.update = []allocTuple{}
+			result.reconnecting = []allocTuple{}
+			return
+		}
 	}
 
-	// updated allocs are for in-place updates of the job (ex. bumping the
-	// version for a constraints update), so we can pick the most recent one and
-	// stop all the rest of the running allocs on the node
+	// updated allocs are for updates of the job (in-place or destructive), so
+	// we can pick the most recent one and stop all the rest of the running
+	// allocs on the node
 	if len(result.update) > 0 {
-		if len(result.update) > 1 {
+		if len(result.update) > count {
 			sortTuples(result.update)
-			result.stop = append(result.stop, result.update[1:]...)
-			result.update = []allocTuple{result.update[0]}
+			result.stop = append(result.stop, result.update[count:]...)
+			result.update = result.update[:count]
 		}
-		result.stop = append(result.stop, result.reconnecting...)
-		result.reconnecting = []allocTuple{}
-		return
+		count = count - len(result.update) // reduce the remaining count
+		if count < 1 {
+			result.stop = append(result.stop, result.reconnecting...)
+			result.reconnecting = []allocTuple{}
+			return
+		}
 	}
 
 	// reconnecting allocs are for when a node reconnects after being lost with
 	// running allocs. we should only see this case if we got out of sync but
 	// never got a chance to eval before the node disconnected. clean up the
 	// remaining mess.
-	if len(result.reconnecting) > 1 {
+	if len(result.reconnecting) > count {
 		sortTuples(result.reconnecting)
-		result.stop = append(result.stop, result.reconnecting[1:]...)
-		result.reconnecting = []allocTuple{result.reconnecting[0]}
+		result.stop = append(result.stop, result.reconnecting[count:]...)
+		result.reconnecting = result.reconnecting[:count]
 	}
 }
 

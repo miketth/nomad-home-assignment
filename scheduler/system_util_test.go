@@ -40,6 +40,7 @@ func TestDiffSystemAllocsForNode_Sysbatch_terminal(t *testing.T) {
 	// that has become terminal, unless the job has been updated.
 
 	job := mock.SystemBatchJob()
+	job.TaskGroups[0].Count = 2
 	required := materializeSystemTaskGroups(job)
 
 	eligible := map[string]*structs.Node{
@@ -65,7 +66,7 @@ func TestDiffSystemAllocsForNode_Sysbatch_terminal(t *testing.T) {
 
 		diff := diffSystemAllocsForNode(job, "node1", eligible, nil, tainted, required, live, terminal, true)
 
-		assertDiffCount(t, diffResultCount{ignore: 1}, diff)
+		assertDiffCount(t, diffResultCount{ignore: 1, place: 1}, diff)
 		if len(diff.ignore) > 0 {
 			must.Eq(t, terminal["node1"]["my-sysbatch.pinger[0]"], diff.ignore[0].Alloc)
 		}
@@ -86,7 +87,7 @@ func TestDiffSystemAllocsForNode_Sysbatch_terminal(t *testing.T) {
 		}
 
 		diff := diffSystemAllocsForNode(job, "node1", eligible, nil, tainted, required, live, terminal, true)
-		assertDiffCount(t, diffResultCount{update: 1}, diff)
+		assertDiffCount(t, diffResultCount{update: 1, place: 1}, diff)
 	})
 
 }
@@ -516,6 +517,12 @@ func TestDiffSystemAllocs(t *testing.T) {
 	ci.Parallel(t)
 
 	job := mock.SystemJob()
+	job.TaskGroups[0].Count = 0 // "web"
+
+	tg := job.TaskGroups[0].Copy()
+	tg.Count = 1
+	tg.Name = "other"
+	job.TaskGroups = append(job.TaskGroups, tg)
 
 	drainNode := mock.DrainNode()
 
@@ -587,7 +594,7 @@ func TestDiffSystemAllocs(t *testing.T) {
 	diff := diffSystemAllocs(job, nodes, nil, tainted, allocs, terminal, true)
 
 	assertDiffCount(t, diffResultCount{
-		update: 1, ignore: 1, migrate: 1, lost: 1, place: 2}, diff)
+		update: 1, ignore: 1, migrate: 1, lost: 1, place: 6}, diff)
 
 	if len(diff.update) > 0 {
 		must.Eq(t, allocs[0], diff.update[0].Alloc) // first alloc should be updated
@@ -607,7 +614,7 @@ func TestDiffSystemAllocs(t *testing.T) {
 	for _, m := range terminal {
 		for _, alloc := range m {
 			for _, tuple := range diff.place {
-				if alloc.NodeID == tuple.Alloc.NodeID {
+				if alloc.NodeID == tuple.Alloc.NodeID && alloc.TaskGroup == "web" {
 					require.Equal(t, alloc, tuple.Alloc)
 				}
 			}
@@ -669,10 +676,11 @@ func TestEvictAndPlace_LimitGreaterThanAllocs(t *testing.T) {
 	require.Equal(t, 4, len(diff.place), "evictAndReplace() didn't insert into diffResult properly: %v", diff.place)
 }
 
-func TestEnsureSingleSystemAlloc(t *testing.T) {
+func TestEnsureMaxSystemAlloc(t *testing.T) {
 	ci.Parallel(t)
 
 	job := mock.SystemJob()
+
 	oldJob := new(structs.Job)
 	*oldJob = *job
 	oldJob.JobModifyIndex -= 1
@@ -691,7 +699,7 @@ func TestEnsureSingleSystemAlloc(t *testing.T) {
 				{Alloc: &structs.Allocation{ID: "reconnecting", Job: job}},
 			},
 		}
-		ensureSingleSystemAlloc(diff)
+		ensureMaxSystemAllocCount(diff, 1)
 		assertDiffCount(t, diffResultCount{ignore: 1, stop: 3}, diff)
 		must.Eq(t, keep, diff.ignore[0].Alloc)
 	})
@@ -706,7 +714,7 @@ func TestEnsureSingleSystemAlloc(t *testing.T) {
 			update:       []allocTuple{},
 			reconnecting: []allocTuple{},
 		}
-		ensureSingleSystemAlloc(diff)
+		ensureMaxSystemAllocCount(diff, 1)
 		assertDiffCount(t, diffResultCount{ignore: 1, stop: 1}, diff)
 		must.Eq(t, keep, diff.ignore[0].Alloc)
 	})
@@ -722,7 +730,7 @@ func TestEnsureSingleSystemAlloc(t *testing.T) {
 				{Alloc: &structs.Allocation{ID: "reconnect", Job: job}},
 			},
 		}
-		ensureSingleSystemAlloc(diff)
+		ensureMaxSystemAllocCount(diff, 1)
 		assertDiffCount(t, diffResultCount{update: 1, stop: 2}, diff)
 		must.Eq(t, keep, diff.update[0].Alloc)
 	})
@@ -735,9 +743,47 @@ func TestEnsureSingleSystemAlloc(t *testing.T) {
 				{Alloc: keep},
 			},
 		}
-		ensureSingleSystemAlloc(diff)
+		ensureMaxSystemAllocCount(diff, 1)
 		assertDiffCount(t, diffResultCount{reconnecting: 1, stop: 1}, diff)
 		must.Eq(t, keep, diff.reconnecting[0].Alloc)
+	})
+
+	t.Run("desired count is larger than ignore set", func(t *testing.T) {
+		diff := &diffResult{
+			ignore: []allocTuple{
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1001}},
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1002}},
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1003}},
+			},
+			update: []allocTuple{
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1004}},
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1005}},
+			},
+		}
+		ensureMaxSystemAllocCount(diff, 4)
+		assertDiffCount(t, diffResultCount{ignore: 3, update: 1, stop: 1}, diff)
+	})
+
+	t.Run("desired count is larger than all sets", func(t *testing.T) {
+		diff := &diffResult{
+			ignore: []allocTuple{
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1001}},
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1002}},
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1003}},
+			},
+			update: []allocTuple{
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1004}},
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1005}},
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1006}},
+			},
+			reconnecting: []allocTuple{
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1007}},
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1008}},
+				{Alloc: &structs.Allocation{Job: job, CreateIndex: 1009}},
+			},
+		}
+		ensureMaxSystemAllocCount(diff, 20)
+		assertDiffCount(t, diffResultCount{ignore: 3, update: 3, reconnecting: 3}, diff)
 	})
 
 }
