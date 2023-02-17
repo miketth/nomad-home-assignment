@@ -323,10 +323,10 @@ func diffSystemAllocsForNode(
 // allocations in a desired-running state.
 func ensureMaxSystemAllocCount(result *diffResult, count int) {
 
-	// sort descending by TaskGroup name, then JobModifyIndex, then
-	// CreateIndex. The inputs are the ignore/update/reconnecting allocations
-	// that were assigned to a single node, so that constrains the size of these
-	// slices and sorting won't be too expensive
+	// sort descending by JobModifyIndex, then CreateIndex. The inputs are the
+	// ignore/update/reconnecting allocations for a single task group that were
+	// assigned to a single node, so that constrains the size of these slices
+	// and sorting won't be too expensive
 	sortTuples := func(tuples []allocTuple) {
 		sort.Slice(tuples, func(i, j int) bool {
 			I, J := tuples[i].Alloc, tuples[j].Alloc
