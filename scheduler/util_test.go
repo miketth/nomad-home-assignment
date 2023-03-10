@@ -16,6 +16,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func BenchmarkTasksUpdated(b *testing.B) {
+	jobA := mock.Job()
+	jobB := jobA.Copy()
+	for n := 0; n < b.N; n++ {
+		if c := tasksUpdated(jobA, jobB, jobA.TaskGroups[0].Name); c.modified {
+			b.Errorf("tasks should be the same")
+		}
+	}
+}
+
 func newNode(name string) *structs.Node {
 	n := mock.Node()
 	n.Name = name
